@@ -609,8 +609,21 @@ class MainActivity : Activity() {
         val state=ledger.shakeRuntime.snapshot()
         val running=state.optBoolean("running")&&state.optBoolean("accessibilityConnected")
         val sheet=MintDialog(this,"摇一摇运行状态")
-        sheet.content.addView(sheet.text(ledger.shakeRuntime.statusMessage(),20,if(running)MintDialog.GREEN else MintDialog.INK,true))
+        val status=sheet.text(ledger.shakeRuntime.statusMessage(),20,if(running)MintDialog.GREEN else MintDialog.INK,true)
+        sheet.content.addView(status)
         sheet.content.addView(sheet.text("打开单笔账单详情，摇一摇即可补录。",14,MintDialog.MUTED).apply { setPadding(0,sheet.dp(10),0,sheet.dp(16)) })
+        sheet.content.addView(android.widget.Switch(this).apply {
+            text="仅在微信、支付宝和淘宝监听摇动"
+            minHeight=sheet.dp(48)
+            isChecked=ledger.channels.shakePaymentAppsOnly()
+            setOnCheckedChangeListener { _, checked ->
+                ledger.channels.setShakePaymentAppsOnly(checked)
+                CaptureRuntime.refreshHealth()
+                ledger.changed()
+                status.text=ledger.shakeRuntime.statusMessage()
+                status.setTextColor(if(ledger.shakeRuntime.snapshot().optBoolean("running"))MintDialog.GREEN else MintDialog.INK)
+            }
+        })
         val recent=ledger.captureHealth.snapshot()
         val successfulAt=recent.optLong("lastSuccessfulAt",0)
         val recentRecord=recent.optLong("lastSuccessfulRecordId",0).takeIf { it>0 }?.let { ledger.store.get(it) }

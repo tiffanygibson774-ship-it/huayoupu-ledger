@@ -32,6 +32,7 @@ class ShakeRuntime(private val context:Context) {
         "disabled" -> "摇一摇已关闭"
         "disconnected" -> "页面识别服务未连接"
         "screen_off","locked" -> "解锁后恢复摇一摇"
+        "waiting_for_payment_app" -> "省电模式 · 等待支付应用"
         "starting" -> "正在启动摇动监听"
         "recovering","stalled" -> "摇动监听恢复中，请检查后台运行设置"
         else -> "摇动监听不可用，请使用截图导入"
@@ -42,6 +43,8 @@ class ShakeRuntime(private val context:Context) {
         val status=CaptureRuntime.sensorStatus()
         return JSONObject().put("running",status=="ready")
             .put("sensorStatus",status).put("sensorRegistered",CaptureRuntime.instance?.sensorRegistered==true)
+            .put("samplingPeriodUs",net.ankio.ledger.core.ShakeSampling.PERIOD_US)
+            .put("paymentAppsOnly",context.ledger.channels.shakePaymentAppsOnly())
             .put("recoveryCount",CaptureRuntime.instance?.recoveryCount?:0)
             .put("lastRecoveryAt",CaptureRuntime.instance?.lastRecoveryAt?:0)
             .put("accessibilityConnected",ScreenCaptureService.current!=null)

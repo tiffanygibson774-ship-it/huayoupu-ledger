@@ -30,6 +30,29 @@ class ShakeDetectorTest {
         assertFalse(detector.sample(1000, 30f, 0f, 0f))
         assertFalse(detector.sample(2000, -30f, 0f, 0f))
     }
+    @Test fun ordinaryShakeStillTriggersAtTheLowerSamplingRate() {
+        val period=ShakeSampling.PERIOD_US/1000L
+        for(phase in 0L until period) {
+            val detector=ShakeDetector()
+            val triggers=(1000L+phase..1850L step period).filter { at ->
+                val strength=if((at-1000L) in 40..99 || (at-1000L) in 240..299 || (at-1000L) in 440..499)30f else 9.8f
+                detector.sample(at,strength,0f,0f)
+            }
+            assertEquals("sampling phase $phase",1,triggers.size)
+            assertTrue(triggers.single() in 1440..1499)
+        }
+    }
+
+    @Test fun paymentOnlyIsOptionalAndFailsClosedForUnknownForeground() {
+        val other="com.example.bank"
+        assertTrue(ShakeSampling.allowsForeground(false,other))
+        assertTrue(ShakeSampling.allowsForeground(false,null))
+        for(app in PaymentApps.entries)assertTrue(ShakeSampling.allowsForeground(true,app.packageName))
+        assertFalse(ShakeSampling.allowsForeground(true,other))
+        assertFalse(ShakeSampling.allowsForeground(true,"com.android.systemui"))
+        assertFalse(ShakeSampling.allowsForeground(true,null))
+    }
+
     @Test fun repeatedStrongMovementTriggersOnceThenCoolsDown() {
         val detector = ShakeDetector()
         assertFalse(detector.sample(1000, 30f, 0f, 0f))

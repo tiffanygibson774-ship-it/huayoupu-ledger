@@ -24,6 +24,10 @@ class ChannelSettings(private val context: Context) {
     private val automaticGenerations=java.util.concurrent.ConcurrentHashMap<String,Long>()
     fun captureEnabled()=enabled(Channel.OCR) || automaticEnabled()
     fun automaticEnabled()=preferences.getBoolean("automatic_enabled",false)
+    internal fun shakePaymentAppsOnly()=preferences.getBoolean("shake_payment_apps_only",false)
+    internal fun setShakePaymentAppsOnly(enabled:Boolean) {
+        preferences.edit().putBoolean("shake_payment_apps_only",enabled).apply()
+    }
     fun selectedAutoPackages():Set<String> = preferences.getStringSet("auto_apps_v1",emptySet()).orEmpty().toSet()
         .intersect(net.ankio.ledger.core.PaymentApps.entries.map { it.packageName }.toSet())
     fun autoAllowed(packageName:String)=automaticEnabled() && packageName in selectedAutoPackages()

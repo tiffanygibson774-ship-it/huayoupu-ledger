@@ -7,15 +7,27 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.hardware.*
 import android.os.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import net.ankio.ledger.core.ShakeDetector
+import net.ankio.ledger.core.ShakeSampling
 import net.ankio.ledger.ledger
 
 /** Sensor listening shares the system-bound accessibility connection; no second service. */
 class CaptureRuntime private constructor(private val service:ScreenCaptureService):SensorEventListener,AutoCloseable {
     private val sensors=service.getSystemService(SensorManager::class.java)
-    private var detector=ShakeDetector()
+    private val power=service.getSystemService(PowerManager::class.java)
+    private val keyguard=service.getSystemService(KeyguardManager::class.java)
+    @Volatile private var detector=ShakeDetector()
     private val mainHandler=Handler(Looper.getMainLooper())
-    private var sensorThread:HandlerThread?=null
+    private val foregroundProbe=CaptureProbe()
+    private var foregroundJob:Job?=null
+    private var foregroundCheckPending=false
+    @Volatile private var foregroundPackage:String?=null
+    @Volatile private var wakeAllowed=false
+    @Volatile private var sensorThread:HandlerThread?=null
     @Volatile private var registered=false
     @Volatile private var registeredAt=-1L
     @Volatile private var retryDelayMs=HEALTH_INTERVAL
@@ -37,8 +49,11 @@ class CaptureRuntime private constructor(private val service:ScreenCaptureServic
     }
     private val screenReceiver=object:BroadcastReceiver() {
         override fun onReceive(context:Context,intent:Intent) {
-            if(intent.action==Intent.ACTION_SCREEN_OFF)stopSensor()
-            else refreshReadiness()
+            if(intent.action==Intent.ACTION_SCREEN_OFF) {
+                wakeAllowed=false
+                clearForeground()
+                stopSensor()
+            } else refreshReadiness()
         }
     }
     init {
@@ -54,23 +69,62 @@ class CaptureRuntime private constructor(private val service:ScreenCaptureServic
         val app=service.ledger
         app.captureHealth.suspendForMissingPermission()
         if(!app.channels.captureEnabled() || !app.channels.permitted(ChannelSettings.Channel.OCR)) { stop();return }
-        updateSensor()
         val wasRunning=running
         running=app.channels.captureEnabled()
         if(!running)stop()
         else {
             if(!wasRunning)app.executionLog.event("system","capture_service","accessibility_runtime_started")
+            updateSensor()
+            refreshForeground()
             app.captureHealth.clearNotice();service.checkPaymentPages();app.captureQueue.resume()
         }
         app.changed()
     }
-    private fun awake()=service.getSystemService(PowerManager::class.java).isInteractive &&
-        !service.getSystemService(KeyguardManager::class.java).isKeyguardLocked
+    private fun awake()=power.isInteractive && !keyguard.isKeyguardLocked
+    private fun foregroundAllowsSampling()=ShakeSampling.allowsForeground(service.ledger.channels.shakePaymentAppsOnly(),foregroundPackage)
+
+    private fun clearForeground() {
+        foregroundJob?.cancel();foregroundJob=null
+        foregroundCheckPending=false;foregroundPackage=null
+    }
+
+    private fun refreshForeground() {
+        if(!service.ledger.channels.shakePaymentAppsOnly() || !service.ledger.channels.enabled(ChannelSettings.Channel.OCR) || !wakeAllowed) {
+            clearForeground();return
+        }
+        // Coalesce focus/activity events; never queue one IPC per accessibility event.
+        foregroundCheckPending=true
+        if(foregroundJob?.isActive==true)return
+        foregroundJob=service.ledger.scope.launch(Dispatchers.Main) {
+            while(foregroundCheckPending) {
+                delay(60)
+                foregroundCheckPending=false
+                val owner=service.foregroundForShakeSampling(foregroundProbe)
+                if(owner==null && !foregroundCheckPending) {
+                    // During a transition Android may publish the focus event before its window.
+                    applyForeground(null)
+                    delay(120)
+                    if(!foregroundCheckPending)applyForeground(service.foregroundForShakeSampling(foregroundProbe))
+                } else applyForeground(owner)
+            }
+        }
+    }
+
+    private fun applyForeground(owner:String?) {
+        val wasAllowed=foregroundAllowsSampling()
+        foregroundPackage=owner
+        if(wasAllowed!=foregroundAllowsSampling()) {
+            updateSensor()
+            service.ledger.changed()
+        }
+    }
+
     /** A successful registration is not proof that continuous sensor events still arrive. */
     private fun updateSensor() {
         mainHandler.removeCallbacks(sensorHealth)
         val app=service.ledger
-        if(!app.channels.enabled(ChannelSettings.Channel.OCR) || !awake()) { stopSensor();return }
+        wakeAllowed=app.channels.enabled(ChannelSettings.Channel.OCR) && awake()
+        if(!wakeAllowed || !foregroundAllowsSampling()) { stopSensor();return }
         val now=SystemClock.elapsedRealtime()
         val freshAt=app.shakeRuntime.lastFreshSampleAtMs
         val stalled=registered && now-maxOf(registeredAt,freshAt)>=HEALTH_INTERVAL
@@ -83,7 +137,7 @@ class CaptureRuntime private constructor(private val service:ScreenCaptureServic
             val sensor=sensors.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
             if(sensor!=null) {
                 val thread=HandlerThread("ledger-shake-sensor").also { it.start();sensorThread=it }
-                registered=sensors.registerListener(this,sensor,SensorManager.SENSOR_DELAY_GAME,0,Handler(thread.looper))
+                registered=sensors.registerListener(this,sensor,ShakeSampling.PERIOD_US,0,Handler(thread.looper))
                 if(registered)app.shakeRuntime.started() else {thread.quitSafely();sensorThread=null}
             }
             if(recovery) {
@@ -97,31 +151,39 @@ class CaptureRuntime private constructor(private val service:ScreenCaptureServic
     private fun sensorState():String {
         val app=service.ledger
         if(!app.channels.enabled(ChannelSettings.Channel.OCR))return "disabled"
-        if(!service.getSystemService(PowerManager::class.java).isInteractive)return "screen_off"
-        if(service.getSystemService(KeyguardManager::class.java).isKeyguardLocked)return "locked"
+        if(!power.isInteractive)return "screen_off"
+        if(keyguard.isKeyguardLocked)return "locked"
+        if(!foregroundAllowsSampling())return "waiting_for_payment_app"
         if(!registered)return if(registeredAt<0)"starting" else "unavailable"
         val freshAt=app.shakeRuntime.lastFreshSampleAtMs
         if(freshAt>=registeredAt && SystemClock.elapsedRealtime()-freshAt<HEALTH_INTERVAL)return "ready"
         if(SystemClock.elapsedRealtime()-registeredAt>=HEALTH_INTERVAL)return "stalled"
         return if(recoveryCount>0)"recovering" else "starting"
     }
+    private fun needsSensorRestore():Boolean = wakeAllowed && foregroundAllowsSampling() &&
+        (!registered || SystemClock.elapsedRealtime()-maxOf(registeredAt,service.ledger.shakeRuntime.lastFreshSampleAtMs)>=HEALTH_INTERVAL)
+
     override fun onSensorChanged(event:SensorEvent) {
-        if(!running || !registered)return
+        val source=Thread.currentThread()
+        val currentDetector=detector
+        if(!running || !registered || source!==sensorThread)return
         val at=event.timestamp/1_000_000
         val received=SystemClock.elapsedRealtime()
         if(at<registeredAt)return
-        val firstFreshSample=service.ledger.shakeRuntime.lastFreshSampleAtMs<registeredAt && received-at in 0..1500L
-        service.ledger.shakeRuntime.sample(at,received)
-        if(received-at in 0..1500L) {retryDelayMs=HEALTH_INTERVAL;retryAt=0}
-        if(firstFreshSample)service.ledger.changed()
-        if(!service.getSystemService(PowerManager::class.java).isInteractive || service.getSystemService(KeyguardManager::class.java).isKeyguardLocked)return
-        if(detector.sample(at,event.values[0],event.values[1],event.values[2],received)) {
-            service.ledger.shakeRuntime.trigger(received-at)
-            processShakeTrigger(ShakeTrigger(at,received))
+        val shakeRuntime=service.ledger.shakeRuntime
+        val firstFreshSample=shakeRuntime.lastFreshSampleAtMs<registeredAt && received-at in 0..1500L
+        shakeRuntime.sample(at,received)
+        if(firstFreshSample) {retryDelayMs=HEALTH_INTERVAL;retryAt=0;service.ledger.changed()}
+        if(currentDetector.sample(at,event.values[0],event.values[1],event.values[2],received)) {
+            mainHandler.post {
+                if(source===sensorThread)processShakeTrigger(ShakeTrigger(at,received))
+            }
         }
     }
     internal fun processShakeTrigger(trigger:ShakeTrigger) {
-        if(!running || !registered || !service.ledger.channels.enabled(ChannelSettings.Channel.OCR) || !trigger.freshAt(SystemClock.elapsedRealtime()))return
+        if(!running || !registered || !service.ledger.channels.enabled(ChannelSettings.Channel.OCR) ||
+            !foregroundAllowsSampling() || !trigger.freshAt(SystemClock.elapsedRealtime()) || !awake())return
+        service.ledger.shakeRuntime.trigger(trigger.receivedAtMs-trigger.eventAtMs)
         service.ledger.executionLog.event("ocr","shake","received",service.ledger.shakeRuntime.snapshot())
         service.captureOnShake(trigger)
     }
@@ -133,13 +195,14 @@ class CaptureRuntime private constructor(private val service:ScreenCaptureServic
     }
     private fun stop() {
         val wasRunning=running
-        running=false;stopSensor()
+        running=false;wakeAllowed=false;clearForeground();stopSensor()
         if(wasRunning) { service.captureServiceStopped();service.ledger.changed() }
     }
     override fun onAccuracyChanged(sensor:Sensor?,accuracy:Int)=Unit
     override fun close() {
         stop();service.contentResolver.unregisterContentObserver(permissionObserver);service.unregisterReceiver(screenReceiver)
         mainHandler.removeCallbacksAndMessages(null)
+        foregroundProbe.close()
         if(instance===this)instance=null
     }
     companion object {
@@ -148,6 +211,10 @@ class CaptureRuntime private constructor(private val service:ScreenCaptureServic
         @Volatile var running=false;private set
         @Volatile internal var instance:CaptureRuntime?=null;private set
         internal fun sensorStatus()=instance?.sensorState()?:"disconnected"
+        internal fun sensorNeedsRestore()=instance?.needsSensorRestore()==true
+        internal fun onWindowChanged(service:ScreenCaptureService) {
+            instance?.takeIf { it.service===service && service.ledger.channels.shakePaymentAppsOnly() }?.refreshForeground()
+        }
         internal fun attach(service:ScreenCaptureService) {
             instance?.close();instance=CaptureRuntime(service);refreshHealth()
         }

@@ -45,17 +45,19 @@ open class ScreenCaptureService:AccessibilityService() {
 
     override fun onAccessibilityEvent(event:AccessibilityEvent?) {
         if(event==null || !ledger.channels.captureEnabled())return
-        if(event.eventType==AccessibilityEvent.TYPE_WINDOWS_CHANGED && event.windowChanges and AccessibilityEvent.WINDOWS_CHANGE_REMOVED!=0)
-            knownWindows.remove(event.windowId)
-        if(event.eventType in setOf(AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,AccessibilityEvent.TYPE_WINDOWS_CHANGED)) {
-            val pkg=event.packageName?.toString()
-            if(CapturePrivacy.manualPackageAllowed(pkg) && event.windowId>=0) {
+        val eventType=event.eventType
+        val eventPackage=event.packageName?.toString()
+        val windowChanged=eventType==AccessibilityEvent.TYPE_WINDOWS_CHANGED
+        val windowRemoved=windowChanged && event.windowChanges and AccessibilityEvent.WINDOWS_CHANGE_REMOVED!=0
+        if(windowRemoved)knownWindows.remove(event.windowId)
+        if(windowChanged || eventType==AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            if(!windowRemoved && CapturePrivacy.manualPackageAllowed(eventPackage) && event.windowId>=0) {
                 if(knownWindows.size>64)knownWindows.clear()
-                knownWindows[event.windowId]=pkg!!
+                knownWindows[event.windowId]=eventPackage!!
             }
+            CaptureRuntime.onWindowChanged(this)
         }
         // Restore only an already enabled capability after a paused runtime.
-        val eventPackage=event.packageName?.toString()
         if(CapturePrivacy.manualPackageAllowed(eventPackage) &&
             (ledger.channels.autoAllowed(eventPackage!!) || ledger.channels.enabled(ChannelSettings.Channel.OCR)))
             restoreEnabledRuntime("payment_event")
@@ -63,7 +65,7 @@ open class ScreenCaptureService:AccessibilityService() {
     }
     private fun restoreEnabledRuntime(reason:String) {
         if(current!==this || !ledger.channels.captureEnabled())return
-        if(CaptureRuntime.running && (!ledger.channels.enabled(ChannelSettings.Channel.OCR) || CaptureRuntime.sensorStatus()=="ready"))return
+        if(CaptureRuntime.running && (!ledger.channels.enabled(ChannelSettings.Channel.OCR) || !CaptureRuntime.sensorNeedsRestore()))return
         val now=SystemClock.elapsedRealtime()
         if(now<runtimeRestoreNotBefore)return
         if(!ledger.channels.permitted(ChannelSettings.Channel.OCR))return
@@ -114,6 +116,23 @@ open class ScreenCaptureService:AccessibilityService() {
         ledger.captureQueue.resume()
         ledger.changed()
     }
+    internal suspend fun foregroundForShakeSampling(probe:CaptureProbe):String? = probe.read(180) {
+        val available=windows
+        try {
+            val top=selectCaptureWindow(available.map { CaptureWindow(it.id,it.type,it.isActive,it.isFocused,it.layer,null,it.isInPictureInPictureMode) })
+                ?:return@read null
+            if(top.type!=AccessibilityWindowInfo.TYPE_APPLICATION)return@read null
+            knownWindows[top.id]?.let { return@read it }
+            // After a service rebind there may not have been an event for this window yet.
+            val window=available.first { it.id==top.id }
+            val root=if(Build.VERSION.SDK_INT>=33)window.getRoot(0) else window.root
+            root?.let { node ->
+                try { if(node.windowId==top.id)node.packageName?.toString() else null }
+                finally { node.recycle() }
+            }
+        } finally { available.forEach { it.recycle() } }
+    }
+
     private suspend fun windowSnapshot(timeout:Long=180):CaptureProbeResult<List<CaptureWindow>> = windowProbe.readResult(timeout) {
         val available=windows
         try { available.map { CaptureWindow(it.id,it.type,it.isActive,it.isFocused,it.layer,null,it.isInPictureInPictureMode) } }
@@ -246,6 +265,7 @@ open class ScreenCaptureService:AccessibilityService() {
                     resolveCaptureTarget { readOwner().also { observed=it;observations.add(it?:"unavailable") } }
                         ?:throw RecognitionException(if(observed==null || observed=="com.android.systemui")"暂时无法确认账单窗口，请收起浮层并在账单页重试" else "当前不是已支持的应用，请进入账单详情页重试")
                 }
+                if(!automatic && !ShakeSampling.allowsForeground(ledger.channels.shakePaymentAppsOnly(),pkg))throw PrivacyBlocked()
                 activePackage=pkg
                 val remaining=400L-(SystemClock.elapsedRealtime()-lastScreenshotAt)
                 if(lastScreenshotAt!=0L && remaining>0)delay(remaining)
