@@ -28,7 +28,7 @@ import org.json.JSONObject
 import kotlinx.coroutines.launch
 
 /** Exposed only to the packaged ledger page; native storage remains the source of truth. */
-class LedgerWebBridge(private val activity: MainActivity) {
+class LedgerWebBridge(private val activity: MainActivity, private val isCurrentPage: () -> Boolean = { true }) {
     private val app get() = activity.ledger
 
     @JavascriptInterface
@@ -728,7 +728,7 @@ class LedgerWebBridge(private val activity: MainActivity) {
     }
 
     private fun onMain(action: () -> Unit) {
-        activity.runOnUiThread { if (!activity.isFinishing && !activity.isDestroyed) action() }
+        activity.runOnUiThread { if (!activity.isFinishing && !activity.isDestroyed && isCurrentPage()) action() }
     }
 
     private fun string(input: JSONObject, key: String, maxLength: Int): String {

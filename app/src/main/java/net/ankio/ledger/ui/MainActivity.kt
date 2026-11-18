@@ -35,13 +35,20 @@ import java.util.Locale
 /** Bundled HTML is the presentation layer; all ledger operations stay in the native local store. */
 class MainActivity : Activity() {
     val uiScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    lateinit var webView: WebView
-        private set
+    private var currentWebView: WebView? = null
+    val webView: WebView get() = checkNotNull(currentWebView)
     lateinit var pageHost: FrameLayout
         private set
     internal var modelPage: EmbeddedModelPage? = null
     private var csvPreviewSheet: MintDialog? = null
     private var ready = false
+    private var pageLoaded = false
+    private var stopped = false
+    private var releasePage: Job? = null
+    private var canReleasePage = false
+    private var documentPickerOpen = false
+    private var fileOperationActive = false
+    private var displayedImportState: ImageImportState? = null
     private var pendingCaptureRepair=false
     private var pendingRecordId:Long?=null
     private var pendingChannel: ChannelSettings.Channel? = null
@@ -72,10 +79,40 @@ class MainActivity : Activity() {
         savedPageState = savedInstanceState?.getString("pageState")
         pendingChannel = savedInstanceState?.getString("pendingChannel")?.let { key -> ChannelSettings.Channel.entries.firstOrNull { it.key == key } }
         savedInstanceState?.getString("permissionSetup")?.let { json -> runCatching { permissionSetup.restoreState(JSONObject(json)) } }
-        previewBytes = ledger.importer.previewBytes
+        documentPickerOpen = savedInstanceState?.getBoolean("documentPickerOpen") ?: false
         val outer = FrameLayout(this).apply { setBackgroundColor(Color.rgb(248,250,252)) }
         pageHost = outer
-        webView = WebView(this).apply {
+        outer.setOnApplyWindowInsetsListener { view, insets ->
+            val safe = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
+            view.setPadding(safe.left, safe.top, safe.right, safe.bottom)
+            val keyboard=if(modelPage==null)(insets.getInsets(WindowInsets.Type.ime()).bottom-safe.bottom).coerceAtLeast(0) else 0
+            currentWebView?.let { web ->
+                val params=web.layoutParams as FrameLayout.LayoutParams
+                if(params.bottomMargin!=keyboard) { params.bottomMargin=keyboard;web.layoutParams=params }
+            }
+            insets
+        }
+        setContentView(outer)
+        window.insetsController?.setSystemBarsAppearance(
+            WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS,
+            WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS)
+        if (Build.VERSION.SDK_INT >= 33) onBackInvokedDispatcher.registerOnBackInvokedCallback(OnBackInvokedDispatcher.PRIORITY_DEFAULT) { handleBack() }
+        requestFeedbackPermission()
+        uiScope.launch { ledger.revision.collect { refresh() } }
+        uiScope.launch { ledger.importer.state.collect { renderImportState(it) } }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        stopped = false
+        releasePage?.cancel()
+        releasePage = null
+        if (currentWebView == null) createLedgerPage()
+    }
+
+    private fun createLedgerPage() {
+        previewBytes = ledger.importer.previewBytes
+        val view = WebView(this).apply ledgerPage@{
             setBackgroundColor(Color.rgb(248,250,252))
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
@@ -84,7 +121,7 @@ class MainActivity : Activity() {
             settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
             settings.blockNetworkLoads = true
             settings.textZoom = (resources.configuration.fontScale * 100).toInt().coerceAtLeast(100)
-            addJavascriptInterface(LedgerWebBridge(this@MainActivity), "LedgerNative")
+            addJavascriptInterface(LedgerWebBridge(this@MainActivity) { currentWebView === this@ledgerPage && ready }, "LedgerNative")
             webViewClient = object : WebViewClient() {
                 override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean = true
                 override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse {
@@ -133,40 +170,33 @@ class MainActivity : Activity() {
                     } catch (_: Exception) { missing() }
                 }
                 override fun onPageFinished(view: WebView?, url: String?) {
-                    ready = true
-                    dispatch("fontScale", resources.configuration.fontScale.toString())
-                    savedPageState?.let { state -> dispatch("restoreState", state) }
-                    savedPageState = null
-                    refresh()
-                    renderImportState(ledger.importer.state.value)
-                    permissionSetup.resume()
-                    resumeCaptureRepair()
-                    openPendingRecord()
+                    if (view !== currentWebView || url != "$localOrigin/web/index.html") return
+                    pageLoaded = true
+                    initializeLedgerPage()
                 }
             }
         }
+        currentWebView = view
         if (BuildConfig.DEBUG) WebView.setWebContentsDebuggingEnabled(true)
-        outer.addView(webView, FrameLayout.LayoutParams(-1, -1))
-        outer.setOnApplyWindowInsetsListener { view, insets ->
-            val safe = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
-            view.setPadding(safe.left, safe.top, safe.right, safe.bottom)
-            val keyboard=if(modelPage==null)(insets.getInsets(WindowInsets.Type.ime()).bottom-safe.bottom).coerceAtLeast(0) else 0
-            val webParams=webView.layoutParams as FrameLayout.LayoutParams
-            if(webParams.bottomMargin!=keyboard) { webParams.bottomMargin=keyboard;webView.layoutParams=webParams }
-            insets
-        }
-        setContentView(outer)
-        window.insetsController?.setSystemBarsAppearance(
-            WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS,
-            WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS)
-        outer.requestApplyInsets()
-        if (Build.VERSION.SDK_INT >= 33) onBackInvokedDispatcher.registerOnBackInvokedCallback(OnBackInvokedDispatcher.PRIORITY_DEFAULT) { handleBack() }
-        requestFeedbackPermission()
-        webView.loadUrl("$localOrigin/web/index.html")
-        uiScope.launch { ledger.revision.collect { refresh() } }
-        uiScope.launch {
-            ledger.importer.state.collect { state -> renderImportState(state) }
-        }
+        pageHost.addView(view, FrameLayout.LayoutParams(-1, -1))
+        pageHost.requestApplyInsets()
+        view.loadUrl("$localOrigin/web/index.html")
+    }
+
+    private fun initializeLedgerPage() {
+        if (!pageLoaded || ready || !captureRestoreResumed) return
+        ready = true
+        dispatch("fontScale", resources.configuration.fontScale.toString())
+        savedPageState?.let { dispatch("restoreState", it) }
+        syncVisiblePage()
+    }
+
+    private fun syncVisiblePage() {
+        refresh()
+        renderImportState(ledger.importer.state.value)
+        permissionSetup.resume()
+        resumeCaptureRepair()
+        openPendingRecord()
     }
 
     private fun requestFeedbackPermission() {
@@ -181,7 +211,8 @@ class MainActivity : Activity() {
     }
 
     private fun renderImportState(state: ImageImportState) {
-        if (!ready) return
+        if (!ready || !captureRestoreResumed || state === displayedImportState) return
+        displayedImportState = state
         when (state) {
             ImageImportState.Working -> {
                 dispatch("importStatus", JSONObject().put("working",true).put("taskId",ledger.importer.activeTask).toString())
@@ -224,8 +255,7 @@ class MainActivity : Activity() {
 
     private fun missing() = WebResourceResponse("text/plain", "UTF-8", 404, "Not Found", emptyMap(), ByteArrayInputStream(ByteArray(0)))
     fun refresh() {
-        // Capture continues in the background; rebuild the WebView only when it is visible.
-        // onResume always requests a fresh snapshot, so no ledger updates are lost.
+        // Resume always requests a fresh snapshot; background recognition does not need the page.
         if (!captureRestoreResumed) return
         if(ready && !permissionSetup.active)requestFeedbackPermission()
         if (previewBytes !== ledger.importer.previewBytes) {
@@ -236,6 +266,7 @@ class MainActivity : Activity() {
     }
     fun rememberPage(json: String) { savedPageState = json }
     internal fun dispatch(event: String, json: String) {
+        if (event == "fileOperation") fileOperationActive = json != "null"
         if (ready && !isDestroyed) webView.evaluateJavascript("window.LedgerUI&&window.LedgerUI.event(${JSONObject.quote(event)},$json)", null)
     }
     internal fun showSetup(state:JSONObject) { if(ready)dispatch("permissionSetup",state.toString()) }
@@ -244,8 +275,11 @@ class MainActivity : Activity() {
     fun message(value: String) { if (ready) dispatch("message", JSONObject.quote(value)) else Toast.makeText(this, value, Toast.LENGTH_LONG).show() }
     private fun handleBack() {
         modelPage?.let { it.back(); return }
-        if (!ready) { finish(); return }
-        webView.evaluateJavascript("window.LedgerUI.back()") { handled -> if (handled != "true") finish() }
+        val view = currentWebView
+        if (!ready || view == null) { finish(); return }
+        view.evaluateJavascript("window.LedgerUI.back()") { handled ->
+            if (currentWebView === view && captureRestoreResumed && handled != "true") finish()
+        }
     }
     @Deprecated("Native activity back navigation")
     override fun onBackPressed() = handleBack()
@@ -271,7 +305,8 @@ class MainActivity : Activity() {
             else if (ledger.channels.permitted(channel)) enableChannel(channel)
             else { ledger.channels.set(channel, false); ledger.changed(); message("尚未获得授权，功能未开启") }
         }
-        if (::webView.isInitialized) { webView.onResume(); refresh();permissionSetup.resume();resumeCaptureRepair() }
+        currentWebView?.onResume()
+        if (ready) syncVisiblePage() else initializeLedgerPage()
     }
     override fun onNewIntent(intent:Intent) {
         super.onNewIntent(intent);setIntent(intent)
@@ -279,7 +314,7 @@ class MainActivity : Activity() {
         if(intent.action==OPEN_RECORD) { pendingRecordId=intent.getLongExtra("recordId",0).takeIf { it>0 };openPendingRecord() }
     }
     private fun openPendingRecord() {
-        if(!ready)return
+        if (!ready || !captureRestoreResumed) return
         val id=pendingRecordId?:return
         pendingRecordId=null
         // A one-shot result link must not reopen after a rotation or process recreation.
@@ -287,7 +322,7 @@ class MainActivity : Activity() {
         refresh();dispatch("openRecord",id.toString())
     }
     private fun resumeCaptureRepair() {
-        if(!ready || !pendingCaptureRepair)return
+        if (!ready || !captureRestoreResumed || !pendingCaptureRepair) return
         pendingCaptureRepair=false;repairCapture()
     }
     internal fun repairCapture() {
@@ -301,23 +336,80 @@ class MainActivity : Activity() {
         else permissionSetup.startAutomatic()
     }
     override fun onPause() {
-        captureRestoreResumed=false;++captureRestoreEpoch
-        if (::webView.isInitialized) {
-            webView.evaluateJavascript("JSON.stringify(window.LedgerUI&&window.LedgerUI.getState())") { value ->
-                if (value != "null") savedPageState = runCatching { org.json.JSONArray("[$value]").getString(0) }.getOrNull()
+        captureRestoreResumed = false
+        val epoch = ++captureRestoreEpoch
+        canReleasePage = false
+        currentWebView?.let { view ->
+            if (ready) view.evaluateJavascript("""
+                JSON.stringify({state: window.LedgerUI.getState(),
+                    canRelease: !document.getElementById('sheet').open &&
+                        document.getElementById('ledger-search-form').hidden &&
+                        !document.getElementById('stats-reimbursement').open})
+            """.trimIndent()) { value ->
+                if (view === currentWebView && epoch == captureRestoreEpoch) {
+                    runCatching { JSONObject(org.json.JSONArray("[$value]").getString(0)) }.getOrNull()?.let { checkpoint ->
+                        checkpoint.optJSONObject("state")?.let { state ->
+                            savedPageState = state.toString()
+                            canReleasePage = checkpoint.optBoolean("canRelease")
+                        }
+                    }
+                }
             }
-            webView.onPause()
+            view.onPause()
         }
         super.onPause()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        stopped = true
+        releasePage = uiScope.launch {
+            delay(BACKGROUND_PAGE_TIMEOUT_MS)
+            releaseIdleWebView()
+        }
+    }
+
+    internal fun releaseIdleWebView(): Boolean {
+        // Transient sheets and an open system picker may contain edits not in getState().
+        if (!stopped || documentPickerOpen || fileOperationActive || (ready && !canReleasePage)) return false
+        if (currentWebView == null) return false
+        destroyLedgerPage()
+        return true
+    }
+
+    private fun destroyLedgerPage() {
+        val view = currentWebView ?: return
+        modelPage?.dismiss(false)
+        ready = false
+        pageLoaded = false
+        displayedImportState = null
+        previewBytes = null
+        currentWebView = null
+        pageHost.removeView(view)
+        view.removeJavascriptInterface("LedgerNative")
+        view.destroy()
     }
     override fun onSaveInstanceState(outState: Bundle) {
         pendingRecordId?.let { outState.putLong("pendingRecordId",it) }
         savedPageState?.let { outState.putString("pageState", it) }
         pendingChannel?.let { outState.putString("pendingChannel", it.key) }
         permissionSetup.saveState()?.let { outState.putString("permissionSetup",it.toString()) }
+        outState.putBoolean("documentPickerOpen", documentPickerOpen)
         super.onSaveInstanceState(outState)
     }
-    override fun onDestroy() { csvPreviewSheet?.dismiss();csvPreviewSheet=null;modelPage?.dismiss(false); uiScope.cancel(); webView.removeJavascriptInterface("LedgerNative"); webView.destroy(); super.onDestroy() }
+    override fun onDestroy() {
+        csvPreviewSheet?.dismiss()
+        csvPreviewSheet = null
+        uiScope.cancel()
+        destroyLedgerPage()
+        super.onDestroy()
+    }
+
+    @Deprecated("Native document picker launch")
+    override fun startActivityForResult(intent: Intent, requestCode: Int) {
+        super.startActivityForResult(intent, requestCode)
+        documentPickerOpen = true
+    }
 
     fun importImage() {
         if (ledger.importer.state.value == ImageImportState.Working) { message("正在识别，请稍候"); return }
@@ -378,6 +470,7 @@ class MainActivity : Activity() {
     @Deprecated("Native document picker result")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode,resultCode,data)
+        documentPickerOpen = false
         if (resultCode!=RESULT_OK) return
         val uri=data?.data ?: return
         when(requestCode) {
@@ -560,8 +653,8 @@ class MainActivity : Activity() {
             sheet.button("管理截图授权").apply { setOnClickListener { afterDismiss={ changeChannel("ocr",false) };sheet.dismiss() } },
             sheet.button("调试与诊断").apply { setOnClickListener { afterDismiss={ showDiagnostics() };sheet.dismiss() } }
         )
-        sheet.onPageDismiss { if(!isFinishing&&!isDestroyed)afterDismiss?.invoke() }
-        sheet.showEmbedded(this,origin,originRadius,"privacy-page")
+        sheet.onPageDismiss { if (captureRestoreResumed && !isFinishing && !isDestroyed) afterDismiss?.invoke() }
+        sheet.showEmbedded(this, origin, originRadius, "privacy-page")
     }
     internal fun showDiagnostics() {
         val snapshot=ledger.executionLog.snapshot()
@@ -589,7 +682,7 @@ class MainActivity : Activity() {
         sheet.content.addView(sheet.text("平时想把账记清楚，却总会遇到这些小麻烦：付款时忘了记，月底想补又记不清；账单散在不同应用里，手动一笔笔填也很费时间。\n\n所以做了花有谱，希望把日常记账变得简单一点。能识别的收支少填几步，需要补充的账单随时记录，让每个月的钱花在哪里更清楚。\n\n无需配置，识别在本机完成，截图和账本保存在本机。",15,MintDialog.INK))
         var afterDismiss:(()->Unit)?=null
         sheet.action("许可与第三方声明") { afterDismiss={ showLicenses() };sheet.dismiss() }
-        sheet.onPageDismiss { if(!isFinishing&&!isDestroyed)afterDismiss?.invoke() }
+        sheet.onPageDismiss { if (captureRestoreResumed && !isFinishing && !isDestroyed) afterDismiss?.invoke() }
         sheet.showEmbedded(this,origin,originRadius,"about-page")
     }
     private fun showLicenses() {
@@ -600,7 +693,7 @@ class MainActivity : Activity() {
         sheet.action("查看第三方依赖声明") { afterDismiss={ showOfflineNotices(false) };sheet.dismiss() }
         sheet.action("字体与图标声明") { afterDismiss={ showOfflineNotices(true) };sheet.dismiss() }
         sheet.action("返回关于花有谱",true) { afterDismiss={ showAbout() };sheet.dismiss() }
-        sheet.onPageDismiss { if(!isFinishing&&!isDestroyed)afterDismiss?.invoke() }
+        sheet.onPageDismiss { if (captureRestoreResumed && !isFinishing && !isDestroyed) afterDismiss?.invoke() }
         sheet.showEmbedded(this,null,pageTag="licenses-page")
     }
     private fun showOfflineNotices(fonts:Boolean,projectLicense:Boolean=false) {
@@ -620,12 +713,19 @@ class MainActivity : Activity() {
         sheet.content.addView(viewer,android.widget.LinearLayout.LayoutParams(-1,(resources.displayMetrics.heightPixels*.55f).toInt()))
         var returning=false
         sheet.action("返回许可说明",true) { returning=true;sheet.dismiss() }
-        sheet.onPageDismiss { viewer.destroy();if(returning&&!isFinishing&&!isDestroyed)showLicenses() }
+        sheet.onPageDismiss {
+            sheet.content.removeView(viewer)
+            viewer.destroy()
+            if (returning && captureRestoreResumed && !isFinishing && !isDestroyed) showLicenses()
+        }
         sheet.showEmbedded(this,null,pageTag="third-party-notices-page")
     }
     override fun onRequestPermissionsResult(requestCode:Int,permissions:Array<out String>,grantResults:IntArray) {
         super.onRequestPermissionsResult(requestCode,permissions,grantResults); refresh()
         if(permissionSetup.active)permissionSetup.resume()
     }
-    companion object { const val OPEN_RECORD="net.ankio.ledger.OPEN_RECORD";const val IMAGE_REQUEST=10; const val EXPORT_REQUEST=11; const val RESTORE_REQUEST=12; const val DIAGNOSTICS_REQUEST=13;const val CSV_GENERAL_REQUEST=14;const val CSV_QIANJI_REQUEST=15;const val CSV_IMPORT_REQUEST=16 }
+    companion object {
+        private const val BACKGROUND_PAGE_TIMEOUT_MS = 30_000L
+        const val OPEN_RECORD="net.ankio.ledger.OPEN_RECORD";const val IMAGE_REQUEST=10; const val EXPORT_REQUEST=11; const val RESTORE_REQUEST=12; const val DIAGNOSTICS_REQUEST=13;const val CSV_GENERAL_REQUEST=14;const val CSV_QIANJI_REQUEST=15;const val CSV_IMPORT_REQUEST=16
+    }
 }
